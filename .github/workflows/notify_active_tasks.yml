@@ -1,0 +1,29 @@
+# このファイルは .github/workflows/notify_active_tasks.yml として配置してください
+name: Notify Active Tasks
+
+on:
+  schedule:
+    # UTC基準。JST 17:00 火曜 = UTC 08:00 火曜
+    - cron: "0 8 * * 2"
+  workflow_dispatch: {}  # 手動実行もできるように
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run notifier
+        env:
+          CSV_URL: ${{ secrets.CSV_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python notify_active_tasks_csv.py
