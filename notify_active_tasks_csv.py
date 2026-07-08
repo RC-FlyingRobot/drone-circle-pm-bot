@@ -38,7 +38,31 @@ def fetch_active_tasks():
     # Google CSVはUTF-8で返る想定。文字化けする場合はresp.contentをcp932等でdecodeする
     resp.encoding = "utf-8"
 
-    reader = csv.DictReader(io.StringIO(resp.text))
+    all_rows = list(csv.reader(io.StringIO(resp.text)))
+
+    # タイトル行や空行が上に何行あっても対応できるよう、
+    # 「タスク名」という列が実際に含まれる行を探してそこをヘッダーとして扱う。
+    header_index = None
+    for i, row in enumerate(all_rows):
+        if "タスク名" in row:
+            header_index = i
+            break
+
+    if header_index is None:
+        raise ValueError(
+            "CSV内に「タスク名」列を含むヘッダー行が見つかりませんでした。"
+            "シートの列名やCSV_URLの参照先タブを確認してください。"
+        )
+
+    header = all_rows[header_index]
+    data_rows = all_rows[header_index + 1:]
+
+    rebuilt = io.StringIO()
+    writer = csv.writer(rebuilt)
+    writer.writerow(header)
+    writer.writerows(data_rows)
+    rebuilt.seek(0)
+    reader = csv.DictReader(rebuilt)
 
     active_tasks = []
     for row in reader:
