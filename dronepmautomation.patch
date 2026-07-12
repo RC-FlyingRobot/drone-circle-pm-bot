@@ -1,0 +1,1068 @@
+From 2b4e9d040d87d76667cd221003b9456c8d11afff Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 12 Jul 2026 02:59:03 +0000
+Subject: [PATCH] =?UTF-8?q?=E9=80=B1=E6=AC=A1=E3=83=AD=E3=83=BC=E3=83=89?=
+ =?UTF-8?q?=E3=83=9E=E3=83=83=E3=83=97=E7=94=9F=E6=88=90+=E3=82=BF?=
+ =?UTF-8?q?=E3=82=B9=E3=82=AF=E3=82=A2=E3=82=B5=E3=82=A4=E3=83=B3=E8=87=AA?=
+ =?UTF-8?q?=E5=8B=95=E5=8C=96=E3=83=9C=E3=83=83=E3=83=88=E3=82=92=E8=BF=BD?=
+ =?UTF-8?q?=E5=8A=A0=E3=80=81=E6=97=A7=E3=82=BF=E3=82=B9=E3=82=AF=E9=80=9A?=
+ =?UTF-8?q?=E7=9F=A5=E3=82=92=E7=B5=B1=E5=90=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sheets読み込み→前処理(クリティカルパス/停滞検知/稼働集計はPythonのみ)→
+Gemini APIでロードマップ・アサイン・理由を構造化出力→Discord通知→履歴ログ追記、
+という一連の流れをsrc/以下に実装。
+
+旧来の進行中タスク列挙のみの週次通知(notify_active_tasks_csv.py)は、
+優先順位づけと理由づけを含む本システムの上位互換として置き換えた。
+---
+ .env.example                                  |  11 ++
+ ...fy_active_tasks.yml => weekly-roadmap.yml} |  19 +-
+ .gitignore                                    |   5 +
+ README.md                                     | 123 ++++++++++++
+ notify_active_tasks_csv.py                    | 125 ------------
+ prompts/system_prompt.md                      |  43 ++++
+ requirements.txt                              |   7 +-
+ src/config.py                                 |  78 ++++++++
+ src/formatter.py                              |  38 ++++
+ src/llm.py                                    |  82 ++++++++
+ src/main.py                                   |  82 ++++++++
+ src/notify.py                                 |  17 ++
+ src/preprocess.py                             | 185 ++++++++++++++++++
+ src/sheets.py                                 |  95 +++++++++
+ 14 files changed, 775 insertions(+), 135 deletions(-)
+ create mode 100644 .env.example
+ rename .github/workflows/{notify_active_tasks.yml => weekly-roadmap.yml} (50%)
+ create mode 100644 .gitignore
+ delete mode 100644 notify_active_tasks_csv.py
+ create mode 100644 prompts/system_prompt.md
+ create mode 100644 src/config.py
+ create mode 100644 src/formatter.py
+ create mode 100644 src/llm.py
+ create mode 100644 src/main.py
+ create mode 100644 src/notify.py
+ create mode 100644 src/preprocess.py
+ create mode 100644 src/sheets.py
+
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..3e71007
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,11 @@
++# Gemini API
++GEMINI_API_KEY=
++GEMINI_MODEL=gemini-2.5-flash
++
++# Google Sheets
++SPREADSHEET_ID=1AO2TPZP1_bZZ3BbGmwfwRYvMpWSIne7CnxEjP-JpYvs
++# サービスアカウントの鍵JSONファイルの中身を、そのまま1行の文字列として貼り付ける
++GCP_SERVICE_ACCOUNT_JSON=
++
++# Discord
++DISCORD_WEBHOOK_URL=
+diff --git a/.github/workflows/notify_active_tasks.yml b/.github/workflows/weekly-roadmap.yml
+similarity index 50%
+rename from .github/workflows/notify_active_tasks.yml
+rename to .github/workflows/weekly-roadmap.yml
+index a5f7b15..6973284 100644
+--- a/.github/workflows/notify_active_tasks.yml
++++ b/.github/workflows/weekly-roadmap.yml
+@@ -1,14 +1,13 @@
+-# このファイルは .github/workflows/notify_active_tasks.yml として配置してください
+-name: Notify Active Tasks
++name: Weekly Roadmap
+ 
+ on:
+   schedule:
+-    # UTC基準。JST 17:00 火曜 = UTC 08:00 火曜
+-    - cron: "0 8 * * 2"
++    # UTC基準。JST 9:00 月曜 = UTC 0:00 月曜
++    - cron: "0 0 * * 1"
+   workflow_dispatch: {}  # 手動実行もできるように
+ 
+ jobs:
+-  notify:
++  generate-roadmap:
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout repo
+@@ -17,13 +16,15 @@ jobs:
+       - name: Set up Python
+         uses: actions/setup-python@v6
+         with:
+-          python-version: "3.11"
++          python-version: "3.12"
+ 
+       - name: Install dependencies
+         run: pip install -r requirements.txt
+ 
+-      - name: Run notifier
++      - name: Generate roadmap and notify
+         env:
+-          CSV_URL: ${{ secrets.CSV_URL }}
++          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
++          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
++          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+-        run: python notify_active_tasks_csv.py
+\ No newline at end of file
++        run: python src/main.py
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..ac7d762
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++.env
++__pycache__/
++*.pyc
++.venv/
++venv/
+diff --git a/README.md b/README.md
+index fb7933f..98d8e0a 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,124 @@
+ # drone-circle-pm-bot
++
++学生ドローン部の「週次ロードマップ生成 + タスクアサイン」自動化ボットです。
++
++## 目的
++
++ドローン部の属人化を解消したいですが、属人化の正体は「作業」ではなく「視点」の属人化です。
++PMが普段行っている「目標から逆算してロードマップを分解し、タスクを各メンバーにアサインする」という
++チーム全体を俯瞰する判断をLLM(Gemini)に代行させます。
++
++さらに通知には必ず「なぜこの優先順位にしたか」という理由を含めます。これにより、単なる作業自動化ではなく、
++部員が逆算思考そのものを学べること(思考の移植)を狙っています。
++
++> **Note**: 旧来の「進行中・未着手タスクを列挙するだけ」の週次通知(`notify_active_tasks_csv.py`)は、
++> 本システムの「優先順位づけ + 理由づけ」を含む上位版に統合し、置き換えました。
++
++## アーキテクチャ
++
++```
++[Googleスプレッドシート]  ← 部員が週次で状況入力
++        │ (週次Cronで起動)
++        ▼
++[GitHub Actions]
++        ▼
++[Python]
++   1. Sheets読み込み (gspread + サービスアカウント)
++   2. 前処理・事実の集計  ← ここはAIを使わない(Pythonだけ)
++        ・依存関係からクリティカルパス算出(networkx)
++        ・停滞タスク検知
++        ・メンバーの空き稼働時間の集計
++        ・大会までの残日数・直前判定
++   3. 履歴ログ読み込み(前回の提案)
++   4. Gemini APIで判断  ← ここだけAI
++        入力 = 前処理で要約した「事実サマリ」
++        出力 = ロードマップ+アサイン+理由(構造化JSON)
++   5. Discord用に整形して送信
++   6. 履歴ログに1行追記
++```
++
++役割分担の原則: **事実の集計はPython、総合判断だけGemini。** 生データを丸投げせず、
++クリティカルパス・停滞・空き時間をPythonで要約してから渡します(精度もコストも良くなります)。
++
++## ディレクトリ構成
++
++```
++drone-circle-pm-bot/
++├── .github/workflows/weekly-roadmap.yml   # 週次Cron(月9:00 JST)+ workflow_dispatch
++├── src/
++│   ├── main.py         # 全体の流れ。--dry-run で送信・追記なしの確認モード
++│   ├── config.py       # タブ名・ヘッダー別名・環境変数
++│   ├── sheets.py        # gspreadで読み書き。normalize_header()でヘッダー表記ゆれを吸収
++│   ├── preprocess.py   # 事実集計(AI不要):critical_path / detect_stalled / member_load / analyze_goal
++│   ├── llm.py           # Gemini呼び出し。pydantic(RoadmapOutput)で構造化出力
++│   ├── formatter.py     # 出力をDiscord用テキストに整形
++│   └── notify.py        # Discord Webhook送信
++├── prompts/system_prompt.md   # 逆算ロジック(判断軸)。コード変更なしで調整可
++├── requirements.txt
++├── .env.example
++└── .gitignore
++```
++
++## スプレッドシート構成
++
++対象: `SPREADSHEET_ID = 1AO2TPZP1_bZZ3BbGmwfwRYvMpWSIne7CnxEjP-JpYvs`
++
++以下のタブを使います(ヘッダーは1行目。日付は `YYYY-MM-DD`、真偽は `TRUE`/`FALSE`)。
++ヘッダー表記のゆれ(括弧・スペースの有無など)は `src/sheets.py` の `normalize_header()` で吸収しますが、
++対応していない大きな表記違いがある場合は `src/config.py` の `*_HEADER_ALIASES` に追記してください。
++
++| タブ | 列 |
++|---|---|
++| 大会・目標 | 大会名 / 大会日 / 目標内容 / 現在の目標か |
++| タスク進捗 | タスクID / タスク名 / 部門 / 担当者 / 進捗率 / ステータス(未着手・進行中・完了) / ボトルネック理由(なし・部品待ち・技術難易度・稼働不足) / 依存タスクID / 残工数h / 備考 |
++| メンバー状況 | 名前 / 週稼働時間h / 得意分野 / 経験レベル(初心者・中級・経験者) / 現在の担当タスク数 / 特記事項 |
++| 履歴ログ | 週 / ロードマップJSON / 実績差分メモ(プログラムが自動追記) |
++
++## セットアップ
++
++### 1. Googleサービスアカウントの準備
++
++1. GCPでサービスアカウントを作成し、鍵(JSON)を発行する
++2. 鍵JSONの `client_email` を対象スプレッドシートに**編集者**として共有する
++
++### 2. ローカルでの疎通確認
++
++```bash
++python -m venv .venv
++source .venv/bin/activate
++pip install -r requirements.txt
++
++cp .env.example .env
++# .env に GEMINI_API_KEY / SPREADSHEET_ID / GCP_SERVICE_ACCOUNT_JSON / DISCORD_WEBHOOK_URL を設定
++set -a; source .env; set +a
++
++python src/main.py --dry-run
++```
++
++`--dry-run` を付けると、Discordへの送信と履歴ログへの追記を行わず、事実サマリと送信予定メッセージを
++標準出力に表示するだけの確認モードになります。
++
++### 3. GitHub Secretsの登録
++
++リポジトリの Settings → Secrets and variables → Actions に以下を登録します。
++
++- `GEMINI_API_KEY`
++- `GCP_SERVICE_ACCOUNT_JSON` (鍵JSONファイルの中身をそのまま貼り付け)
++- `SPREADSHEET_ID`
++- `DISCORD_WEBHOOK_URL`
++
++### 4. 動作確認・週次運用
++
++GitHub Actions の `Weekly Roadmap` ワークフローを `Run workflow` で手動実行して本番疎通を確認したら、
++`.github/workflows/weekly-roadmap.yml` の cron(毎週月曜9:00 JST)により自動運用に移行します。
++
++## 判断軸のカスタマイズ
++
++`prompts/system_prompt.md` を編集することで、コードを変更せずにGeminiの判断ロジック(優先順位づけ・
++アサインの考え方)を調整できます。
++
++## 今後の拡張(TODO)
++
++- 停滞検知を「前週比の進捗差分」で精緻化する(履歴にper-task進捗を持たせる)
++- アサインをDiscordのリアクションで承認制にする
++- Notionへの書き出しを追加する
+diff --git a/notify_active_tasks_csv.py b/notify_active_tasks_csv.py
+deleted file mode 100644
+index 530c5fb..0000000
+--- a/notify_active_tasks_csv.py
++++ /dev/null
+@@ -1,125 +0,0 @@
+-"""
+-毎週火曜17:00(JST)に実行:
+-Google SheetsのCSV公開URLから、ステータスが
+-「進行中」または「未着手」のタスクを箇条書きでDiscordに通知する。
+-
+-出力フォーマット:
+-  * タスク名：担当者
+-
+-必要な環境変数:
+-  CSV_URL              : スプレッドシートの「ウェブに公開」で発行したCSV URL
+-  DISCORD_WEBHOOK_URL  : DiscordのWebhook URL
+-
+-事前準備:
+-  スプレッドシート → ファイル → 共有 → ウェブに公開
+-  → 対象タブを選択 → 形式を「カンマ区切りの値(.csv)」にして公開
+-  → 発行されたURLを CSV_URL として使う
+-"""
+-
+-import os
+-import io
+-import csv
+-import datetime
+-import requests
+-
+-TARGET_STATUSES = {"進行中", "未着手"}
+-
+-
+-def fetch_active_tasks():
+-    """
+-    シートの列構成:
+-    A: No / B: タスク名 / C: 担当者 / D: グループ / E: 優先度 / F: ステータス / G: メモ / H: 期限
+-
+-    抽出条件: ステータスが「進行中」または「未着手」
+-    """
+-    csv_url = os.environ["CSV_URL"]
+-    resp = requests.get(csv_url)
+-    resp.raise_for_status()
+-    # Google CSVはUTF-8で返る想定。文字化けする場合はresp.contentをcp932等でdecodeする
+-    resp.encoding = "utf-8"
+-
+-    all_rows = list(csv.reader(io.StringIO(resp.text)))
+-
+-    # タイトル行や空行が上に何行あっても対応できるよう、
+-    # 「タスク名」という列が実際に含まれる行を探してそこをヘッダーとして扱う。
+-    header_index = None
+-    for i, row in enumerate(all_rows):
+-        if "タスク名" in row:
+-            header_index = i
+-            break
+-
+-    if header_index is None:
+-        raise ValueError(
+-            "CSV内に「タスク名」列を含むヘッダー行が見つかりませんでした。"
+-            "シートの列名やCSV_URLの参照先タブを確認してください。"
+-        )
+-
+-    header = all_rows[header_index]
+-    data_rows = all_rows[header_index + 1:]
+-
+-    rebuilt = io.StringIO()
+-    writer = csv.writer(rebuilt)
+-    writer.writerow(header)
+-    writer.writerows(data_rows)
+-    rebuilt.seek(0)
+-    reader = csv.DictReader(rebuilt)
+-
+-    active_tasks = []
+-    for row in reader:
+-        name = (row.get("タスク名") or "").strip()
+-        assignee = (row.get("担当者") or "").strip()
+-        status = (row.get("ステータス") or "").strip()
+-
+-        if not name or status not in TARGET_STATUSES:
+-            continue
+-
+-        active_tasks.append({
+-            "name": name,
+-            "assignee": assignee or "未割当",
+-            "status": status,
+-        })
+-
+-    return active_tasks
+-
+-
+-def build_message(tasks):
+-    today_str = datetime.date.today().strftime("%Y/%m/%d")
+-    lines = [f"**📋 タスク状況({today_str})**"]
+-
+-    if not tasks:
+-        lines.append("進行中・未着手のタスクはありません。")
+-        return "\n".join(lines)
+-
+-    in_progress = [t for t in tasks if t["status"] == "進行中"]
+-    not_started = [t for t in tasks if t["status"] == "未着手"]
+-
+-    if in_progress:
+-        lines.append("\n**▶️ 進行中**")
+-        for t in in_progress:
+-            lines.append(f"* {t['name']}：{t['assignee']}")
+-
+-    if not_started:
+-        lines.append("\n**⬜ 未着手**")
+-        for t in not_started:
+-            lines.append(f"* {t['name']}：{t['assignee']}")
+-
+-    return "\n".join(lines)
+-
+-
+-def send_to_discord(message: str):
+-    webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
+-    chunks = [message[i:i + 1900] for i in range(0, len(message), 1900)] or [message]
+-    for chunk in chunks:
+-        resp = requests.post(webhook_url, json={"content": chunk})
+-        resp.raise_for_status()
+-
+-
+-def main():
+-    tasks = fetch_active_tasks()
+-    message = build_message(tasks)
+-    send_to_discord(message)
+-    print("送信完了:\n", message)
+-
+-
+-if __name__ == "__main__":
+-    main()
+\ No newline at end of file
+diff --git a/prompts/system_prompt.md b/prompts/system_prompt.md
+new file mode 100644
+index 0000000..88cab83
+--- /dev/null
++++ b/prompts/system_prompt.md
+@@ -0,0 +1,43 @@
++# 役割
++
++あなたはドローン部のプロジェクトマネージャーの「逆算思考」を代行するアシスタントです。
++渡される「事実サマリ」(クリティカルパス・停滞タスク・メンバーの空き稼働時間・大会までの残日数・前回のロードマップ)
++だけをもとに、今週のロードマップとタスクアサインを決定してください。
++事実サマリに書かれていない情報を推測で補ったり、数値を捏造したりしないこと。
++
++# 目的(最重要)
++
++この出力は単なる作業指示ではありません。`priority_reasoning` と各アサインの `reason` を読んだ部員が、
++「なぜこの順番なのか」「なぜ自分がこのタスクなのか」を理解し、将来は自分でも同じ逆算判断ができるようになる
++ことが最大の目的です。結論だけでなく、判断の道筋を具体的に言語化してください。
++
++# 判断軸
++
++1. **クリティカルパス最優先**
++   `critical_path.path` に含まれるタスクは、大会までの全体スケジュールを決定づける。
++   他のタスクより優先してロードマップの先頭に据える。
++
++2. **停滞タスクは原因別に対応**
++   `stalled_tasks` の `reason` に応じて対応方針を変える。
++   - 部品待ち → 発注・代替調達など、担当者個人ではなく「詰まりの解消」自体をタスク化する
++   - 技術難易度 → 経験者(`experience_level` が「経験者」)を巻き込む、ペア作業にする
++   - 稼働不足 → 他メンバーへの振り直し、タスクの分割を検討する
++
++3. **大会直前は安定化優先**
++   `goal.is_imminent` が true の場合、新機能開発より既存機能の安定化・信頼性向上を優先する。
++   直前でない場合(残日数に余裕がある場合)は、挑戦的なタスクへの着手も許容する。
++
++4. **アサインは「得意分野・経験・空き時間」の3点で決める**
++   `member_loads` の各メンバーについて:
++   - `is_overloaded` が true のメンバーには新規タスクを積まない
++   - `experience_level` が「初心者」のメンバーを、技術難易度が高いタスクの単独担当にしない(経験者とのペアを検討する)
++   - `specialty` とタスクの部門が一致する組み合わせを優先する
++   - `is_idle`(残工数0)のメンバーは積極的にアサイン対象にする
++
++# 出力上の注意
++
++- `roadmap` は「今週注力すべきテーマ」ごとにグルーピングし、クリティカルパス上のタスクを含むテーマを先頭に置くこと
++- `assignments` の `reason` は、上記の判断軸のどれに基づく判断かが分かる形で具体的に書くこと
++- `risks` には、対応しきれなかった停滞タスクや、稼働時間が逼迫しているメンバーなど、次週以降に持ち越すリスクを挙げること
++- `priority_reasoning` には、今週のロードマップ全体の優先順位づけの理由を、クリティカルパス・残日数・停滞状況を踏まえて具体的に説明すること
++- `previous_roadmap` が渡されている場合は、前回からの継続性(前回優先したものが今回どうなったか)にも触れること
+diff --git a/requirements.txt b/requirements.txt
+index ef487e0..9e35562 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1,6 @@
+-requests==2.32.3
+\ No newline at end of file
++google-genai>=0.3.0
++gspread>=6.1.0
++google-auth>=2.35.0
++networkx>=3.3
++requests>=2.32.3
++pydantic>=2.9.0
+diff --git a/src/config.py b/src/config.py
+new file mode 100644
+index 0000000..2506c78
+--- /dev/null
++++ b/src/config.py
+@@ -0,0 +1,78 @@
++"""タブ名・ヘッダー別名・環境変数の定義。"""
++
++import os
++
++# --- スプレッドシート ---
++SPREADSHEET_ID = os.environ.get(
++    "SPREADSHEET_ID", "1AO2TPZP1_bZZ3BbGmwfwRYvMpWSIne7CnxEjP-JpYvs"
++)
++
++# --- タブ名 ---
++TAB_GOALS = "大会・目標"
++TAB_TASKS = "タスク進捗"
++TAB_MEMBERS = "メンバー状況"
++TAB_HISTORY = "履歴ログ"
++
++# --- 環境変数 ---
++GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
++GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
++GCP_SERVICE_ACCOUNT_JSON = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
++DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
++
++# --- ステータス・区分の定数 ---
++STATUS_NOT_STARTED = "未着手"
++STATUS_IN_PROGRESS = "進行中"
++STATUS_DONE = "完了"
++ACTIVE_STATUSES = {STATUS_NOT_STARTED, STATUS_IN_PROGRESS}
++
++BOTTLENECK_NONE = "なし"
++BOTTLENECK_PARTS = "部品待ち"
++BOTTLENECK_DIFFICULTY = "技術難易度"
++BOTTLENECK_CAPACITY = "稼働不足"
++
++EXPERIENCE_LEVELS = ["初心者", "中級", "経験者"]
++
++# 大会直前とみなす残日数のしきい値
++IMMINENT_DAYS_THRESHOLD = 14
++
++# --- ヘッダー表記ゆれ吸収用の別名リスト ---
++# key: 内部で使う正規化済みフィールド名 / value: シート上で許容する表記のバリエーション
++GOALS_HEADER_ALIASES = {
++    "competition_name": ["大会名", "大会", "イベント名"],
++    "competition_date": ["大会日", "大会日程", "開催日"],
++    "goal_content": ["目標内容", "目標", "目標詳細"],
++    "is_current_goal": ["現在の目標か", "現在の目標", "対象"],
++}
++
++TASKS_HEADER_ALIASES = {
++    "task_id": ["タスクID", "タスクId", "ID"],
++    "task_name": ["タスク名", "タスク"],
++    "department": ["部門", "担当部門", "グループ"],
++    "assignee": ["担当者", "担当"],
++    "progress_pct": ["進捗率", "進捗率(%)", "進捗率（%）", "進捗"],
++    "status": ["ステータス", "状態"],
++    "bottleneck_reason": ["ボトルネック理由", "ボトルネック", "停滞理由"],
++    "dependency_ids": ["依存タスクID", "依存タスク", "前提タスクID"],
++    "remaining_hours": ["残工数h", "残工数(h)", "残工数（h）", "残工数"],
++    "notes": ["備考", "メモ"],
++}
++
++MEMBERS_HEADER_ALIASES = {
++    "name": ["名前", "氏名"],
++    "weekly_capacity_hours": [
++        "週稼働時間h",
++        "週稼働時間(h)",
++        "週稼働時間（h）",
++        "週稼働時間",
++    ],
++    "specialty": ["得意分野", "得意領域", "専門"],
++    "experience_level": ["経験レベル", "レベル"],
++    "current_task_count": ["現在の担当タスク数", "担当タスク数"],
++    "remarks": ["特記事項", "備考"],
++}
++
++HISTORY_HEADER_ALIASES = {
++    "week": ["週", "週次", "対象週"],
++    "roadmap_json": ["ロードマップJSON", "ロードマップ", "roadmap"],
++    "diff_notes": ["実績差分メモ", "差分メモ", "実績メモ"],
++}
+diff --git a/src/formatter.py b/src/formatter.py
+new file mode 100644
+index 0000000..3689406
+--- /dev/null
++++ b/src/formatter.py
+@@ -0,0 +1,38 @@
++"""RoadmapOutputをDiscord向けMarkdownテキストに整形する。"""
++
++import datetime
++
++from llm import RoadmapOutput
++
++
++def format_roadmap(roadmap: RoadmapOutput, goal: dict | None = None) -> str:
++    today_str = datetime.date.today().strftime("%Y/%m/%d")
++    lines = [f"**🚁 週次ロードマップ({today_str})**"]
++
++    if goal:
++        days = goal.get("days_remaining")
++        days_str = f"残り{days}日" if days is not None else "日程未定"
++        imminent = " ⚠️直前" if goal.get("is_imminent") else ""
++        lines.append(f"🎯 目標: {goal.get('competition_name', '')}({days_str}){imminent}")
++
++    lines.append("\n**▶️ 今週の注力ポイント**")
++    for focus in roadmap.roadmap:
++        lines.append(f"* **{focus.focus}**")
++        for task_id in focus.tasks:
++            lines.append(f"  - {task_id}")
++
++    if roadmap.assignments:
++        lines.append("\n**👤 アサイン**")
++        for a in roadmap.assignments:
++            lines.append(f"* {a.member} → {a.task}")
++            lines.append(f"  理由: {a.reason}")
++
++    if roadmap.risks:
++        lines.append("\n**⚠️ リスク**")
++        for r in roadmap.risks:
++            lines.append(f"* {r}")
++
++    lines.append("\n**🧭 なぜこの優先順位か**")
++    lines.append(roadmap.priority_reasoning)
++
++    return "\n".join(lines)
+diff --git a/src/llm.py b/src/llm.py
+new file mode 100644
+index 0000000..a1529c3
+--- /dev/null
++++ b/src/llm.py
+@@ -0,0 +1,82 @@
++"""Gemini APIによる総合判断(ロードマップ生成)。
++
++役割分担の原則: 事実の集計はPython(preprocess.py)、総合判断だけここでGeminiに任せる。
++生データは渡さず、事実サマリ(要約済みJSON)だけを渡す。
++"""
++
++import datetime
++import json
++from pathlib import Path
++
++from google import genai
++from google.genai import types
++from pydantic import BaseModel, Field
++
++import config
++
++SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "system_prompt.md"
++
++
++class RoadmapFocus(BaseModel):
++    focus: str = Field(description="今週注力すべきテーマ")
++    tasks: list[str] = Field(description="対応するタスクIDのリスト")
++
++
++class Assignment(BaseModel):
++    member: str = Field(description="担当メンバー名")
++    task: str = Field(description="タスクIDまたはタスク名")
++    reason: str = Field(description="このアサインを選んだ理由")
++
++
++class RoadmapOutput(BaseModel):
++    roadmap: list[RoadmapFocus]
++    assignments: list[Assignment]
++    risks: list[str]
++    priority_reasoning: str = Field(
++        description="なぜこの優先順位にしたか。部員が逆算思考を学べるように具体的に書く"
++    )
++
++
++def _load_system_prompt() -> str:
++    return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
++
++
++def build_fact_summary(
++    goal: dict | None,
++    critical_path_result: dict,
++    stalled_tasks: list[dict],
++    member_loads: list[dict],
++    previous_roadmap: dict | None,
++) -> dict:
++    """前処理結果をGeminiに渡す「事実サマリ」としてまとめる。"""
++    return {
++        "today": datetime.date.today().isoformat(),
++        "goal": goal,
++        "critical_path": critical_path_result,
++        "stalled_tasks": stalled_tasks,
++        "member_loads": member_loads,
++        "previous_roadmap": previous_roadmap,
++    }
++
++
++def generate_roadmap(fact_summary: dict) -> RoadmapOutput:
++    if not config.GEMINI_API_KEY:
++        raise RuntimeError("環境変数 GEMINI_API_KEY が設定されていません。")
++
++    client = genai.Client(api_key=config.GEMINI_API_KEY)
++
++    response = client.models.generate_content(
++        model=config.GEMINI_MODEL,
++        contents=_fact_summary_to_text(fact_summary),
++        config=types.GenerateContentConfig(
++            system_instruction=_load_system_prompt(),
++            response_mime_type="application/json",
++            response_schema=RoadmapOutput,
++        ),
++    )
++
++    return RoadmapOutput.model_validate_json(response.text)
++
++
++def _fact_summary_to_text(fact_summary: dict) -> str:
++    return json.dumps(fact_summary, ensure_ascii=False, indent=2)
+diff --git a/src/main.py b/src/main.py
+new file mode 100644
+index 0000000..14a43a4
+--- /dev/null
++++ b/src/main.py
+@@ -0,0 +1,82 @@
++"""週次ロードマップ生成+タスクアサイン自動化のエントリポイント。
++
++流れ:
++  1. Sheets読み込み(gspread)
++  2. 前処理・事実の集計(AI不使用。critical_path / stalled / member_load / goal)
++  3. 履歴ログ読み込み(前回の提案)
++  4. Gemini APIで判断(ロードマップ+アサイン+理由)
++  5. Discord用に整形して送信
++  6. 履歴ログに1行追記
++
++--dry-run を付けると、Discord送信と履歴追記を行わず、事実サマリと送信予定メッセージを標準出力に表示するだけ。
++"""
++
++import argparse
++import datetime
++import json
++
++import config
++import formatter
++import llm
++import notify
++import preprocess
++import sheets
++
++
++def run(dry_run: bool = False) -> str:
++    client = sheets.get_client()
++
++    goals = sheets.read_goals(client)
++    tasks = sheets.read_tasks(client)
++    members = sheets.read_members(client)
++    history = sheets.read_history(client)
++
++    goal = preprocess.analyze_goal(goals)
++    cp_result = preprocess.critical_path(tasks)
++    stalled = preprocess.detect_stalled(tasks)
++    loads = preprocess.member_load(tasks, members)
++
++    previous_roadmap = None
++    if history:
++        previous_json = (history[-1] or {}).get("roadmap_json")
++        if previous_json:
++            try:
++                previous_roadmap = json.loads(previous_json)
++            except json.JSONDecodeError:
++                previous_roadmap = None
++
++    fact_summary = llm.build_fact_summary(goal, cp_result, stalled, loads, previous_roadmap)
++    roadmap = llm.generate_roadmap(fact_summary)
++    message = formatter.format_roadmap(roadmap, goal)
++
++    if dry_run:
++        print("=== 事実サマリ(Geminiへの入力) ===")
++        print(json.dumps(fact_summary, ensure_ascii=False, indent=2))
++        print("\n=== Discord送信予定メッセージ(dry-runのため送信・履歴追記は行いません) ===")
++        print(message)
++        return message
++
++    notify.send_to_discord(message)
++    sheets.append_history(
++        week=datetime.date.today().isoformat(),
++        roadmap_json=roadmap.model_dump_json(),
++        client=client,
++    )
++
++    return message
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="週次ロードマップ生成+タスクアサイン")
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Discord送信・履歴追記を行わず、結果を標準出力に表示するだけの確認モード",
++    )
++    args = parser.parse_args()
++
++    run(dry_run=args.dry_run)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/notify.py b/src/notify.py
+new file mode 100644
+index 0000000..6a6e429
+--- /dev/null
++++ b/src/notify.py
+@@ -0,0 +1,17 @@
++"""Discord Webhookへの送信。"""
++
++import requests
++
++import config
++
++CHUNK_SIZE = 1900
++
++
++def send_to_discord(message: str) -> None:
++    if not config.DISCORD_WEBHOOK_URL:
++        raise RuntimeError("環境変数 DISCORD_WEBHOOK_URL が設定されていません。")
++
++    chunks = [message[i : i + CHUNK_SIZE] for i in range(0, len(message), CHUNK_SIZE)] or [message]
++    for chunk in chunks:
++        resp = requests.post(config.DISCORD_WEBHOOK_URL, json={"content": chunk})
++        resp.raise_for_status()
+diff --git a/src/preprocess.py b/src/preprocess.py
+new file mode 100644
+index 0000000..55a6200
+--- /dev/null
++++ b/src/preprocess.py
+@@ -0,0 +1,185 @@
++"""事実の集計(AIを使わない前処理)。
++
++シートから読み込んだ生データを、Geminiに渡すための「事実サマリ」に変換する。
++クリティカルパス算出・停滞検知・メンバー稼働状況・大会までの残日数を、ここでPythonだけで計算する。
++"""
++
++import datetime
++
++import networkx as nx
++
++import config
++
++
++def build_dependency_graph(tasks: list[dict]) -> nx.DiGraph:
++    """依存タスクIDを辺として持つ有向グラフを構築する。
++
++    エッジの向きは 依存先 -> 依存元(そのタスク自身)。依存先が終わらないと着手できない、という関係を表す。
++    """
++    graph = nx.DiGraph()
++    for task in tasks:
++        task_id = (task.get("task_id") or "").strip()
++        if not task_id:
++            continue
++        graph.add_node(
++            task_id,
++            remaining_hours=_to_float(task.get("remaining_hours")),
++            task=task,
++        )
++
++    for task in tasks:
++        task_id = (task.get("task_id") or "").strip()
++        if not task_id:
++            continue
++        for dep_id in _split_ids(task.get("dependency_ids") or ""):
++            if dep_id not in graph:
++                # 依存先が未登録(完了済みで対象外、または表記ミス)のIDでも落ちないようにする
++                graph.add_node(dep_id, remaining_hours=0.0, task=None)
++            graph.add_edge(dep_id, task_id)
++
++    return graph
++
++
++def critical_path(tasks: list[dict]) -> dict:
++    """残工数を重みとしたクリティカルパス(最長経路)を算出する。完了タスクは対象外。"""
++    active_tasks = [t for t in tasks if t.get("status") != config.STATUS_DONE]
++    graph = build_dependency_graph(active_tasks)
++
++    if graph.number_of_nodes() == 0:
++        return {"path": [], "total_hours": 0.0}
++
++    if not nx.is_directed_acyclic_graph(graph):
++        # 壊れたデータ(循環依存)でも落ちないよう、サイクルを構成するノードを除いてDAG化する
++        cycle_nodes: set[str] = set()
++        for cycle in nx.simple_cycles(graph):
++            cycle_nodes.update(cycle)
++        graph.remove_nodes_from(cycle_nodes)
++
++    if graph.number_of_nodes() == 0:
++        return {"path": [], "total_hours": 0.0}
++
++    order = list(nx.topological_sort(graph))
++    longest = {node: graph.nodes[node]["remaining_hours"] for node in order}
++    predecessor: dict[str, str | None] = {node: None for node in order}
++
++    for node in order:
++        for succ in graph.successors(node):
++            candidate = longest[node] + graph.nodes[succ]["remaining_hours"]
++            if candidate > longest[succ]:
++                longest[succ] = candidate
++                predecessor[succ] = node
++
++    end_node = max(longest, key=longest.get)
++    path = []
++    node: str | None = end_node
++    while node is not None:
++        path.append(node)
++        node = predecessor[node]
++    path.reverse()
++
++    return {"path": path, "total_hours": longest[end_node]}
++
++
++def detect_stalled(tasks: list[dict]) -> list[dict]:
++    """ボトルネック理由が「なし」以外で、未完了のタスクを停滞タスクとして抽出する。"""
++    stalled = []
++    for task in tasks:
++        if task.get("status") == config.STATUS_DONE:
++            continue
++        reason = (task.get("bottleneck_reason") or "").strip()
++        if reason and reason != config.BOTTLENECK_NONE:
++            stalled.append(
++                {
++                    "task_id": task.get("task_id"),
++                    "task_name": task.get("task_name"),
++                    "assignee": task.get("assignee"),
++                    "reason": reason,
++                }
++            )
++    return stalled
++
++
++def member_load(tasks: list[dict], members: list[dict]) -> list[dict]:
++    """メンバーごとの週稼働時間に対する残工数の割当状況を集計する。"""
++    remaining_by_assignee: dict[str, float] = {}
++    task_count_by_assignee: dict[str, int] = {}
++    for task in tasks:
++        if task.get("status") == config.STATUS_DONE:
++            continue
++        assignee = (task.get("assignee") or "").strip()
++        if not assignee:
++            continue
++        hours = _to_float(task.get("remaining_hours"))
++        remaining_by_assignee[assignee] = remaining_by_assignee.get(assignee, 0.0) + hours
++        task_count_by_assignee[assignee] = task_count_by_assignee.get(assignee, 0) + 1
++
++    result = []
++    for member in members:
++        name = member.get("name")
++        capacity = _to_float(member.get("weekly_capacity_hours"))
++        assigned_hours = remaining_by_assignee.get(name, 0.0)
++        result.append(
++            {
++                "name": name,
++                "weekly_capacity_hours": capacity,
++                "assigned_remaining_hours": assigned_hours,
++                "task_count": task_count_by_assignee.get(name, 0),
++                "utilization": (assigned_hours / capacity) if capacity > 0 else None,
++                "is_overloaded": capacity > 0 and assigned_hours > capacity,
++                "is_idle": assigned_hours == 0.0,
++                "specialty": member.get("specialty"),
++                "experience_level": member.get("experience_level"),
++            }
++        )
++
++    return result
++
++
++def analyze_goal(goals: list[dict], today: datetime.date | None = None) -> dict | None:
++    """現在の目標を特定し、大会までの残日数・直前判定を行う。"""
++    today = today or datetime.date.today()
++
++    current = next((g for g in goals if _to_bool(g.get("is_current_goal"))), None)
++    if current is None and goals:
++        current = goals[0]
++    if current is None:
++        return None
++
++    competition_date = _parse_date(current.get("competition_date"))
++    days_remaining = (competition_date - today).days if competition_date else None
++
++    return {
++        "competition_name": current.get("competition_name"),
++        "competition_date": current.get("competition_date"),
++        "goal_content": current.get("goal_content"),
++        "days_remaining": days_remaining,
++        "is_imminent": days_remaining is not None
++        and 0 <= days_remaining <= config.IMMINENT_DAYS_THRESHOLD,
++    }
++
++
++def _split_ids(raw: str) -> list[str]:
++    normalized = raw
++    for sep in ["、", ",", "，", "/", " "]:
++        normalized = normalized.replace(sep, "\n")
++    return [s.strip() for s in normalized.split("\n") if s.strip()]
++
++
++def _to_float(value, default: float = 0.0) -> float:
++    try:
++        return float(str(value).strip())
++    except (TypeError, ValueError):
++        return default
++
++
++def _to_bool(value) -> bool:
++    return str(value).strip().upper() in ("TRUE", "1", "YES", "はい")
++
++
++def _parse_date(value) -> datetime.date | None:
++    if not value:
++        return None
++    try:
++        return datetime.datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
++    except ValueError:
++        return None
+diff --git a/src/sheets.py b/src/sheets.py
+new file mode 100644
+index 0000000..d560b79
+--- /dev/null
++++ b/src/sheets.py
+@@ -0,0 +1,95 @@
++"""Google Sheets読み書き。ヘッダーの表記ゆれは normalize_header() で吸収する。"""
++
++import json
++import unicodedata
++
++import gspread
++from google.oauth2.service_account import Credentials
++
++import config
++
++SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
++
++
++def normalize_header(text: str) -> str:
++    """全角/半角・空白・括弧の表記ゆれを吸収するための正規化。"""
++    text = unicodedata.normalize("NFKC", text or "")
++    for ch in " 　()（）・-_":
++        text = text.replace(ch, "")
++    return text.lower()
++
++
++def _build_reverse_lookup(aliases: dict) -> dict:
++    lookup = {}
++    for canonical, variants in aliases.items():
++        for variant in variants:
++            lookup[normalize_header(variant)] = canonical
++    return lookup
++
++
++def get_client() -> gspread.Client:
++    if not config.GCP_SERVICE_ACCOUNT_JSON:
++        raise RuntimeError("環境変数 GCP_SERVICE_ACCOUNT_JSON が設定されていません。")
++    info = json.loads(config.GCP_SERVICE_ACCOUNT_JSON)
++    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
++    return gspread.authorize(creds)
++
++
++def _read_tab(client: gspread.Client, tab_name: str, aliases: dict) -> list[dict]:
++    """タブを読み込み、ヘッダーを正規化フィールド名に変換した辞書リストで返す。"""
++    spreadsheet = client.open_by_key(config.SPREADSHEET_ID)
++    worksheet = spreadsheet.worksheet(tab_name)
++    raw_rows = worksheet.get_all_values()
++
++    if not raw_rows:
++        return []
++
++    lookup = _build_reverse_lookup(aliases)
++    header_row = raw_rows[0]
++    normalized_header = [lookup.get(normalize_header(h)) for h in header_row]
++
++    records = []
++    for row in raw_rows[1:]:
++        if not any(cell.strip() for cell in row):
++            continue  # 空行はスキップ
++        record = {}
++        for key, value in zip(normalized_header, row):
++            if key is None:
++                continue  # 未知の列(別名リストにない列)は無視
++            record[key] = value.strip()
++        records.append(record)
++
++    return records
++
++
++def read_goals(client: gspread.Client | None = None) -> list[dict]:
++    client = client or get_client()
++    return _read_tab(client, config.TAB_GOALS, config.GOALS_HEADER_ALIASES)
++
++
++def read_tasks(client: gspread.Client | None = None) -> list[dict]:
++    client = client or get_client()
++    return _read_tab(client, config.TAB_TASKS, config.TASKS_HEADER_ALIASES)
++
++
++def read_members(client: gspread.Client | None = None) -> list[dict]:
++    client = client or get_client()
++    return _read_tab(client, config.TAB_MEMBERS, config.MEMBERS_HEADER_ALIASES)
++
++
++def read_history(client: gspread.Client | None = None) -> list[dict]:
++    client = client or get_client()
++    return _read_tab(client, config.TAB_HISTORY, config.HISTORY_HEADER_ALIASES)
++
++
++def append_history(
++    week: str,
++    roadmap_json: str,
++    diff_notes: str = "",
++    client: gspread.Client | None = None,
++) -> None:
++    """履歴ログタブに1行追記する。"""
++    client = client or get_client()
++    spreadsheet = client.open_by_key(config.SPREADSHEET_ID)
++    worksheet = spreadsheet.worksheet(config.TAB_HISTORY)
++    worksheet.append_row([week, roadmap_json, diff_notes], value_input_option="USER_ENTERED")
+-- 
+2.43.0
+

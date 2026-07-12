@@ -1,14 +1,13 @@
-# このファイルは .github/workflows/notify_active_tasks.yml として配置してください
-name: Notify Active Tasks
+name: Weekly Roadmap
 
 on:
   schedule:
-    # UTC基準。JST 17:00 火曜 = UTC 08:00 火曜
-    - cron: "0 8 * * 2"
+    # UTC基準。JST 9:00 月曜 = UTC 0:00 月曜
+    - cron: "0 0 * * 1"
   workflow_dispatch: {}  # 手動実行もできるように
 
 jobs:
-  notify:
+  generate-roadmap:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -17,13 +16,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run notifier
+      - name: Generate roadmap and notify
         env:
-          CSV_URL: ${{ secrets.CSV_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python notify_active_tasks_csv.py
+        run: python src/main.py
